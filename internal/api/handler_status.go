@@ -5,11 +5,13 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gastownhall/gascity/internal/agent"
 	"github.com/gastownhall/gascity/internal/beads"
 	"github.com/gastownhall/gascity/internal/config"
+	"github.com/gastownhall/gascity/internal/mail"
 	"github.com/gastownhall/gascity/internal/session"
 	workdirutil "github.com/gastownhall/gascity/internal/workdir"
 )
@@ -171,42 +173,65 @@ func (s *Server) buildStatusBody() StatusBody {
 		})
 	}
 
-	// Count work items (best-effort).
-	var wc workCounts
+	// Independent store/provider fan-out. Each section below makes blocking
+	// store or mail round-trips; running them serially made status latency
+	// scale with the number of stores + named sessions (~N×round-trip), which
+	// dominated the endpoint. Stores and providers are internally synchronized,
+	// so concurrent reads are safe — each goroutine writes only its own
+	// preallocated slot and results are merged after Wait.
+	var wg sync.WaitGroup
+
+	// Count work items (best-effort): one goroutine per unique store.
 	stores := s.state.BeadStores()
+	type rigStore struct {
+		name  string
+		store beads.Store
+	}
+	var uniqueStores []rigStore
 	seenStores := make(map[string]bool)
 	for _, rigName := range sortedRigNames(stores) {
-		store := stores[rigName]
-		key := fmt.Sprintf("%p", store)
+		st := stores[rigName]
+		key := fmt.Sprintf("%p", st)
 		if seenStores[key] {
 			continue
 		}
 		seenStores[key] = true
-		list, err := store.List(beads.ListQuery{AllowScan: true})
-		if err != nil {
-			partialErrors = append(partialErrors, fmt.Sprintf("rig %s work: %v", rigName, err))
-			if !beads.IsPartialResult(err) || len(list) == 0 {
-				continue
+		uniqueStores = append(uniqueStores, rigStore{rigName, st})
+	}
+	workResults := make([]workCounts, len(uniqueStores))
+	workErrs := make([]string, len(uniqueStores))
+	for i, rs := range uniqueStores {
+		wg.Add(1)
+		go func(i int, rs rigStore) {
+			defer wg.Done()
+			list, err := rs.store.List(beads.ListQuery{AllowScan: true})
+			if err != nil {
+				workErrs[i] = fmt.Sprintf("rig %s work: %v", rs.name, err)
+				if !beads.IsPartialResult(err) || len(list) == 0 {
+					return
+				}
 			}
-		}
-		for _, b := range list {
-			switch b.Type {
-			case "message", "convoy", "convergence":
-				continue
+			var c workCounts
+			for _, b := range list {
+				switch b.Type {
+				case "message", "convoy", "convergence":
+					continue
+				}
+				switch b.Status {
+				case "in_progress":
+					c.InProgress++
+				case "ready":
+					c.Ready++
+				case "open":
+					c.Open++
+				}
 			}
-			switch b.Status {
-			case "in_progress":
-				wc.InProgress++
-			case "ready":
-				wc.Ready++
-			case "open":
-				wc.Open++
-			}
-		}
+			workResults[i] = c
+		}(i, rs)
 	}
 
-	// Count mail (best-effort).
-	var mc mailCounts
+	// Count mail (best-effort): one goroutine per unique provider.
+	var uniqueProviders []mail.Provider
 	seenProvs := make(map[string]bool)
 	for _, mp := range s.state.MailProviders() {
 		key := fmt.Sprintf("%p", mp)
@@ -214,31 +239,72 @@ func (s *Server) buildStatusBody() StatusBody {
 			continue
 		}
 		seenProvs[key] = true
-		if total, unread, err := mp.Count(""); err == nil {
-			mc.Total += total
-			mc.Unread += unread
-		}
+		uniqueProviders = append(uniqueProviders, mp)
+	}
+	type mailResult struct {
+		total, unread int
+		ok            bool
+	}
+	mailResults := make([]mailResult, len(uniqueProviders))
+	for i, mp := range uniqueProviders {
+		wg.Add(1)
+		go func(i int, mp mail.Provider) {
+			defer wg.Done()
+			if total, unread, err := mp.Count(""); err == nil {
+				mailResults[i] = mailResult{total, unread, true}
+			}
+		}(i, mp)
 	}
 
-	// Collect named sessions (best-effort; skip when unavailable).
-	var namedSessionDetails []StatusNamedSessionDetail
-	for _, ns := range cfg.NamedSessions {
-		identity := ns.QualifiedName()
-		mode := ns.ModeOrDefault()
-		status := s.namedSessionStatus(cfg, store, cityName, identity, mode, suspendedRigs)
-		namedSessionDetails = append(namedSessionDetails, StatusNamedSessionDetail{
-			Identity: identity,
-			Status:   status,
-			Mode:     mode,
-		})
+	// Collect named sessions (best-effort): one goroutine per session, order preserved.
+	namedSessionDetails := make([]StatusNamedSessionDetail, len(cfg.NamedSessions))
+	for i := range cfg.NamedSessions {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			ns := cfg.NamedSessions[i]
+			identity := ns.QualifiedName()
+			mode := ns.ModeOrDefault()
+			namedSessionDetails[i] = StatusNamedSessionDetail{
+				Identity: identity,
+				Status:   s.namedSessionStatus(cfg, store, cityName, identity, mode, suspendedRigs),
+				Mode:     mode,
+			}
+		}(i)
 	}
 
 	// Session counts: walk the city bead store for session beads.
 	var sessionCounts *StatusSessionCountsDetail
 	if store != nil {
-		active, suspended := s.countSessions(store)
-		if active > 0 || suspended > 0 {
-			sessionCounts = &StatusSessionCountsDetail{Active: active, Suspended: suspended}
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			active, suspended := s.countSessions(store)
+			if active > 0 || suspended > 0 {
+				sessionCounts = &StatusSessionCountsDetail{Active: active, Suspended: suspended}
+			}
+		}()
+	}
+
+	wg.Wait()
+
+	// Merge fan-out results (race-free: all goroutines have returned).
+	var wc workCounts
+	for _, c := range workResults {
+		wc.InProgress += c.InProgress
+		wc.Ready += c.Ready
+		wc.Open += c.Open
+	}
+	for _, e := range workErrs {
+		if e != "" {
+			partialErrors = append(partialErrors, e)
+		}
+	}
+	var mc mailCounts
+	for _, r := range mailResults {
+		if r.ok {
+			mc.Total += r.total
+			mc.Unread += r.unread
 		}
 	}
 
